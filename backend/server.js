@@ -1,5 +1,3 @@
-// server.js (compatível com Vercel)
-
 require("dotenv").config();
 
 const express = require("express");
@@ -7,96 +5,80 @@ const cors = require("cors");
 
 const app = express();
 
-app.use(cors());
+// ✅ CORS CONFIGURADO CORRETAMENTE
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://projetoqatelecom.vercel.app"
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // permite requests sem origin (ex: Postman)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    } else {
+      return callback(new Error("Not allowed by CORS"));
+    }
+  },
+  methods: ["GET", "POST"],
+  credentials: true
+}));
+
 app.use(express.json());
 
-function sanitize(str, maxLen = 8000) {
-  if (!str) return "";
-  return str.replace(/<[^>]*>/g, "").trim().slice(0, maxLen);
-}
-
-function validate(body) {
-  const { agent, company, type, transcript } = body;
-
-  if (!agent) return "Agent inválido";
-  if (!company) return "Company inválida";
-  if (!["Chat", "Ligação"].includes(type)) return "Tipo inválido";
-  if (!transcript || transcript.length < 10) return "Transcrição inválida";
-
-  return null;
-}
-
-function buildPrompt(agent, company, type, transcript) {
-  return `
-Você é um QA SÊNIOR de telecom.
-
-Analise o atendimento:
-
-Agente: ${agent}
-Empresa: ${company}
-Tipo: ${type}
-
-TRANSCRIÇÃO:
-${transcript}
-
-Responda SOMENTE JSON válido:
-
-{
- "criteria":[
-   {"id":"saudacao","score":0-10,"obs":"..."}
- ],
- "pontos_fortes":"...",
- "pontos_desenvolver":"...",
- "feedback":"..."
-}
-`;
-}
-
-app.get("/api/health", (_, res) => {
+// ✅ HEALTH CHECK
+app.get("/api/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+// ✅ IA - AVALIAÇÃO
 app.post("/api/evaluate", async (req, res) => {
-  const error = validate(req.body);
-  if (error) return res.status(400).json({ error });
-
-  const { agent, company, type, transcript } = req.body;
-
   try {
+    const { text } = req.body;
+
+    if (!text) {
+      return res.status(400).json({ error: "Texto é obrigatório" });
+    }
+
     const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: "google/gemini-2.0-flash-exp:free",
+        model: "openai/gpt-3.5-turbo",
         messages: [
           {
             role: "user",
-            content: buildPrompt(agent, company, type, sanitize(transcript))
+            content: `Avalie o seguinte atendimento:\n\n${text}`
           }
         ]
       })
     });
 
     const data = await response.json();
-    const raw = data.choices?.[0]?.message?.content;
-
-    let parsed = JSON.parse(raw.replace(/```json|```/g, ""));
-
-    const avg =
-      parsed.criteria.reduce((acc, c) => acc + Number(c.score), 0) /
-      parsed.criteria.length;
 
     res.json({
-      score: Number(avg.toFixed(1)),
-      ...parsed
+      result: data.choices?.[0]?.message?.content || "Sem resposta da IA"
     });
 
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    console.error("Erro na IA:", error);
+    res.status(500).json({ error: "Erro ao processar avaliação" });
   }
 });
 
-module.exports = app;
+// ✅ ROTA RAIZ (evita Cannot GET /)
+app.get("/", (req, res) => {
+  res.send("API rodando 🚀");
+});
+
+// ✅ PORTA DINÂMICA (Railway)
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, () => {
+  console.log(`Servidor rodando na porta ${PORT}`);
+});
