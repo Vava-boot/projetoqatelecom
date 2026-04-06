@@ -1,7 +1,7 @@
 {
   "name": "qa-telecom-frontend",
   "version": "1.0.0",
-  "description": "Interface React para QA Telecom Monitor — Sirius Assessoria",
+  "description": "Interface React QA Telecom Monitor — Sirius Assessoria",
   "type": "module",
   "scripts": {
     "dev": "vite",
