@@ -15,7 +15,7 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // Postman, etc
+    if (!origin) return callback(null, true);
 
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
@@ -38,14 +38,14 @@ app.get("/api/health", (req, res) => {
 });
 
 // ==============================
-// ✅ ROTA RAIZ (evita erro)
+// ✅ ROTA RAIZ
 // ==============================
 app.get("/", (req, res) => {
   res.send("API rodando 🚀");
 });
 
 // ==============================
-// ✅ FUNÇÃO DE CHAMADA DA IA
+// 🤖 FUNÇÃO IA
 // ==============================
 async function callAI(content) {
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -59,7 +59,7 @@ async function callAI(content) {
       messages: [
         {
           role: "user",
-          content: `Avalie o atendimento abaixo e dê um feedback profissional:\n\n${content}`
+          content: `Avalie o atendimento e dê um feedback profissional:\n\n${content}`
         }
       ]
     })
@@ -71,19 +71,17 @@ async function callAI(content) {
 }
 
 // ==============================
-// ✅ ROTA PRINCIPAL (CHAT + CALL)
+// 🚀 ROTA PRINCIPAL
 // ==============================
 app.post("/api/evaluate", async (req, res) => {
   try {
     const { type, text, audioUrl } = req.body;
 
-    console.log("📥 Request recebido:", req.body);
+    console.log("📥 Request:", req.body);
 
     let content = "";
 
-    // ==========================
     // 💬 CHAT
-    // ==========================
     if (type === "chat") {
       if (!text) {
         return res.status(400).json({
@@ -94,38 +92,30 @@ app.post("/api/evaluate", async (req, res) => {
       content = text;
     }
 
-    // ==========================
-    // 📞 LIGAÇÃO
-    // ==========================
+    // 📞 CALL
     else if (type === "call") {
       if (!audioUrl) {
         return res.status(400).json({
-          error: "audioUrl é obrigatório para ligação"
+          error: "audioUrl é obrigatório para call"
         });
       }
 
-      // 🔥 Aqui você pode integrar transcrição futuramente
-      content = `Avaliação de ligação baseada no áudio: ${audioUrl}`;
+      content = `Avalie esta ligação com base no áudio: ${audioUrl}`;
     }
 
-    // ==========================
-    // ❌ TIPO INVÁLIDO
-    // ==========================
+    // ❌ ERRO
     else {
       return res.status(400).json({
         error: "Tipo inválido. Use 'chat' ou 'call'"
       });
     }
 
-    // ==========================
-    // 🤖 CHAMAR IA
-    // ==========================
     const result = await callAI(content);
 
     res.json({ result });
 
   } catch (error) {
-    console.error("❌ Erro interno:", error);
+    console.error("❌ Erro:", error);
 
     res.status(500).json({
       error: "Erro interno do servidor"
@@ -134,7 +124,7 @@ app.post("/api/evaluate", async (req, res) => {
 });
 
 // ==============================
-// ✅ START SERVIDOR
+// ▶️ START
 // ==============================
 const PORT = process.env.PORT || 3001;
 
