@@ -3,6 +3,9 @@ const express   = require("express");
 const cors      = require("cors");
 const rateLimit = require("express-rate-limit");
 
+const OPENROUTER_API_KEY = (process.env.OPENROUTER_API_KEY || "").trim();
+const isKeyValid = OPENROUTER_API_KEY.length > 0 && !OPENROUTER_API_KEY.includes(" ");
+
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
@@ -60,24 +63,65 @@ Responda SOMENTE em JSON válido, sem markdown, sem explicações fora do JSON:
 }
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", key_configured: !!process.env.OPENROUTER_API_KEY, node: process.version, port: PORT });
+  const keyPreview = isKeyValid
+    ? `${OPENROUTER_API_KEY.slice(0, 10)}...${OPENROUTER_API_KEY.slice(-5)}`
+    : "(não configurada)";
+  res.json({
+    status:         "ok",
+    key_configured: isKeyValid,
+    key_length:     OPENROUTER_API_KEY.length,
+    key_preview:    keyPreview,
+    node:           process.version,
+    port:           PORT
+  });
 });
 
 app.get("/api/test-openrouter", async (_req, res) => {
-  if (!process.env.OPENROUTER_API_KEY)
-    return res.status(500).json({ error: "Chave não configurada." });
+  console.log("[DEBUG] /api/test-openrouter — isKeyValid:", isKeyValid, "| key_length:", OPENROUTER_API_KEY.length);
+
+  if (!isKeyValid) {
+    console.log("[ERRO] Chave inválida ou não configurada.");
+    return res.status(500).json({ error: "Chave não configurada ou inválida.", key_length: OPENROUTER_API_KEY.length });
+  }
+
+  const requestHeaders = {
+    "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
+    "HTTP-Referer":  "https://qa-telecom-jzym.vercel.app",
+    "X-Title":       "QA Telecom Monitor",
+    "User-Agent":    "QATelecom/1.0 (Railway)"
+  };
+
+  console.log("[DEBUG] Enviando requisição para OpenRouter /models");
+
   try {
-    const r = await fetch("https://openrouter.ai/api/v1/models", {
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
-        "HTTP-Referer":  "https://qa-telecom-jzym.vercel.app",
-        "X-Title":       "QA Telecom Monitor"
+    const r = await fetch("https://openrouter.ai/api/v1/models", { headers: requestHeaders });
+    const data = await r.json();
+
+    console.log("[INFO] OpenRouter respondeu com status:", r.status);
+
+    if (!r.ok) {
+      console.log("[ERRO] OpenRouter retornou erro:", JSON.stringify(data));
+      return res.status(r.status).json({
+        error:          data,
+        debug: {
+          status:         r.status,
+          headers_sent:   { Authorization: `Bearer ${OPENROUTER_API_KEY.slice(0, 10)}...`, "HTTP-Referer": requestHeaders["HTTP-Referer"] }
+        }
+      });
+    }
+
+    console.log("[INFO] Teste bem-sucedido — modelos disponíveis:", data.data?.length);
+    return res.json({
+      status:       "ok",
+      models_count: data.data?.length,
+      debug: {
+        status:       r.status,
+        key_length:   OPENROUTER_API_KEY.length,
+        key_preview:  `${OPENROUTER_API_KEY.slice(0, 10)}...${OPENROUTER_API_KEY.slice(-5)}`
       }
     });
-    const data = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: data });
-    return res.json({ status: "ok", models_count: data.data?.length });
   } catch (err) {
+    console.log("[ERRO] Exceção em /api/test-openrouter:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -88,27 +132,30 @@ app.post("/api/evaluate", async (req, res) => {
 
   const { agent, company, type, transcript } = req.body;
 
-  if (!process.env.OPENROUTER_API_KEY) {
-    console.error("[ERRO] OPENROUTER_API_KEY não configurada");
+  if (!isKeyValid) {
+    console.error("[ERRO] OPENROUTER_API_KEY não configurada ou inválida — key_length:", OPENROUTER_API_KEY.length);
     return res.status(500).json({ error: "Chave de API não configurada no servidor." });
   }
 
   try {
     console.log(`[INFO] Avaliando — ${agent} | ${company} | ${type}`);
+    console.log(`[DEBUG] Modelo(s): google/gemini-2.0-flash-exp:free, meta-llama/llama-3.3-70b-instruct:free, mistralai/mistral-7b-instruct:free`);
 
     const controller = new AbortController();
     const timeout    = setTimeout(() => controller.abort(), 30000);
 
     let openRouterRes;
     try {
+      console.log("[DEBUG] Enviando fetch para OpenRouter /chat/completions");
       openRouterRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         signal: controller.signal,
         headers: {
           "Content-Type":  "application/json",
-          "Authorization": `Bearer ${process.env.OPENROUTER_API_KEY}`,
+          "Authorization": `Bearer ${OPENROUTER_API_KEY}`,
           "HTTP-Referer":  "https://qa-telecom-jzym.vercel.app",
-          "X-Title":       "QA Telecom Monitor"
+          "X-Title":       "QA Telecom Monitor",
+          "User-Agent":    "QATelecom/1.0 (Railway)"
         },
         body: JSON.stringify({
           // ":free" garante sem custo — fallback automático entre os 3
@@ -138,6 +185,8 @@ app.post("/api/evaluate", async (req, res) => {
       clearTimeout(timeout);
     }
 
+    console.log(`[DEBUG] OpenRouter respondeu com status: ${openRouterRes.status}`);
+
     if (!openRouterRes.ok) {
       const errText = await openRouterRes.text();
       console.error(`[ERRO] OpenRouter HTTP ${openRouterRes.status}:`, errText);
@@ -149,7 +198,7 @@ app.post("/api/evaluate", async (req, res) => {
     const data = await openRouterRes.json();
     const raw  = data.choices?.[0]?.message?.content || "";
 
-    console.log(`[INFO] Modelo usado: ${data.model}`);
+    console.log(`[DEBUG] Modelo usado: ${data.model}`);
 
     if (!raw) {
       console.error("[ERRO] Resposta vazia:", JSON.stringify(data));
@@ -172,7 +221,7 @@ app.post("/api/evaluate", async (req, res) => {
     const avg   = parsed.criteria.reduce((s, c) => s + Number(c.score), 0) / parsed.criteria.length;
     const score = Math.round(avg * 10) / 10;
 
-    console.log(`[INFO] Concluído — score: ${score}`);
+    console.log(`[DEBUG] Score final calculado: ${score}`);
 
     return res.json({
       criteria:           parsed.criteria,
@@ -193,6 +242,9 @@ app.post("/api/evaluate", async (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
+  const keyPreview = isKeyValid
+    ? `${OPENROUTER_API_KEY.slice(0, 10)}...${OPENROUTER_API_KEY.slice(-5)}`
+    : "(não configurada)";
   console.log(`✅ Servidor rodando na porta ${PORT}`);
-  console.log(`🔑 Chave: ${!!process.env.OPENROUTER_API_KEY ? "configurada ✓" : "NÃO CONFIGURADA ✗"}`);
+  console.log(`🔑 Chave: ${isKeyValid ? "configurada ✓" : "NÃO CONFIGURADA ✗"} | length: ${OPENROUTER_API_KEY.length} | preview: ${keyPreview}`);
 });
