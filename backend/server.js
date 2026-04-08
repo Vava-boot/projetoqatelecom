@@ -6,6 +6,13 @@ const rateLimit = require("express-rate-limit");
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+// Modelos em ordem de prioridade — fallback automático
+const MODELS = [
+  "openai/gpt-4o-mini",
+  "mistralai/mistral-7b-instruct",
+  "google/gemini-2.0-flash-001",
+];
+
 app.use(express.json({ limit: "1mb" }));
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:5173").split(",");
@@ -72,84 +79,120 @@ Responda SOMENTE em JSON válido, sem markdown, sem explicações fora do JSON:
 {"criteria":[{"id":"saudacao","score":8,"obs":"observação detalhada"},{"id":"tom_voz","score":7,"obs":"..."},{"id":"tempo_espera","score":9,"obs":"..."},{"id":"tempo_atendimento","score":7,"obs":"..."},{"id":"uso_mudo","score":6,"obs":"..."},{"id":"personalizacao","score":7,"obs":"..."},{"id":"tratativa","score":8,"obs":"..."},{"id":"gramatica","score":8,"obs":"..."},{"id":"dados_obrigatorios","score":9,"obs":"..."},{"id":"protocolo_encerramento","score":6,"obs":"..."}],"pontos_fortes":"texto curto e direto","pontos_desenvolver":"texto curto e direto","feedback":"Feedback construtivo usando primeiro nome do agente"}`;
 }
 
+async function callOpenRouter(apiKey, model, prompt) {
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type":  "application/json",
+      "Authorization": `Bearer ${apiKey}`,
+      "HTTP-Referer":  "https://qa-telecom-jzym.vercel.app",
+      "X-Title":       "QA Telecom Monitor"
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens:  1200,
+      temperature: 0.3,
+      messages: [
+        {
+          role:    "system",
+          content: "Você é um sistema de avaliação de qualidade de atendimento. Responda SEMPRE e SOMENTE em JSON válido, sem markdown."
+        },
+        {
+          role:    "user",
+          content: prompt
+        }
+      ]
+    })
+  });
+  return response;
+}
+
 app.post("/api/evaluate", async (req, res) => {
   const validationError = validateEvalRequest(req.body);
   if (validationError) return res.status(400).json({ error: validationError });
 
   const { agent, company, type, transcript } = req.body;
-
   const apiKey = (process.env.OPENROUTER_API_KEY || "").trim();
 
   if (!apiKey) {
-    console.error("[ERRO] OPENROUTER_API_KEY não configurada.");
+    console.error("[ERRO CRÍTICO] OPENROUTER_API_KEY não configurada.");
     return res.status(500).json({ error: "Chave de API não configurada no servidor." });
   }
 
   console.log(`[INFO] Avaliando — ${agent} | ${company} | ${type}`);
 
-  try {
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type":  "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-        "HTTP-Referer":  "https://qa-telecom-jzym.vercel.app",
-        "X-Title":       "QA Telecom Monitor"
-      },
-      body: JSON.stringify({
-        model:       "google/gemini-2.0-flash-001",
-        max_tokens:  1200,
-        temperature: 0.3,
-        messages: [
-          {
-            role:    "system",
-            content: "Você é um sistema de avaliação de qualidade de atendimento. Responda SEMPRE e SOMENTE em JSON válido, sem markdown."
-          },
-          {
-            role:    "user",
-            content: buildPrompt(agent, company, type, transcript)
-          }
-        ]
-      })
-    });
+  const prompt = buildPrompt(agent, company, type, transcript);
+  let lastError = null;
 
-    if (!response.ok) {
-      const errBody = await response.text();
-      console.error(`[ERRO] OpenRouter HTTP ${response.status}:`, errBody);
-      return res.status(502).json({ error: "Erro ao consultar IA. Tente novamente." });
-    }
-
-    const data = await response.json();
-    const raw  = data.choices?.[0]?.message?.content || "";
-
-    let parsed;
+  for (const model of MODELS) {
+    console.log(`[INFO] Tentando modelo: ${model}`);
     try {
-      parsed = JSON.parse(raw.replace(/```json|```/gi, "").trim());
-    } catch {
-      console.error("[ERRO] JSON inválido da IA:", raw.slice(0, 200));
-      return res.status(502).json({ error: "Resposta da IA em formato inválido. Tente novamente." });
+      const response = await callOpenRouter(apiKey, model, prompt);
+      console.log(`[INFO] Status OpenRouter: ${response.status} | modelo: ${model}`);
+
+      // 401 — chave inválida, não adianta tentar outro modelo
+      if (response.status === 401) {
+        const body = await response.text();
+        console.error(`[ERRO CRÍTICO] 401 chave inválida:`, body);
+        return res.status(500).json({ error: "Chave de API inválida. Verifique as configurações do servidor." });
+      }
+
+      // 429 ou 402 — tentar próximo modelo
+      if (response.status === 429 || response.status === 402) {
+        const body = await response.text();
+        console.warn(`[FALLBACK] ${response.status} em ${model}: ${body.slice(0, 200)}`);
+        lastError = `HTTP ${response.status} em ${model}`;
+        continue;
+      }
+
+      if (!response.ok) {
+        const body = await response.text();
+        console.error(`[ERRO] HTTP ${response.status} em ${model}:`, body.slice(0, 200));
+        lastError = `HTTP ${response.status} em ${model}`;
+        continue;
+      }
+
+      const data = await response.json();
+      const raw  = data.choices?.[0]?.message?.content || "";
+
+      let parsed;
+      try {
+        parsed = JSON.parse(raw.replace(/```json|```/gi, "").trim());
+      } catch {
+        console.error(`[ERRO] JSON inválido da IA (${model}):`, raw.slice(0, 200));
+        lastError = `JSON inválido do modelo ${model}`;
+        continue;
+      }
+
+      if (!Array.isArray(parsed.criteria) || parsed.criteria.length < 10) {
+        console.warn(`[AVISO] Resposta incompleta do modelo ${model}`);
+        lastError = `Resposta incompleta do modelo ${model}`;
+        continue;
+      }
+
+      const avg   = parsed.criteria.reduce((s, c) => s + Number(c.score), 0) / parsed.criteria.length;
+      const score = Math.round(avg * 10) / 10;
+
+      console.log(`[OK] Avaliação gerada — modelo: ${model} | score: ${score}`);
+
+      return res.json({
+        criteria:           parsed.criteria,
+        score,
+        pontos_fortes:      parsed.pontos_fortes      || "",
+        pontos_desenvolver: parsed.pontos_desenvolver  || "",
+        feedback:           parsed.feedback            || ""
+      });
+
+    } catch (err) {
+      console.error(`[ERRO] Exceção com modelo ${model}:`, err.message);
+      lastError = err.message;
+      continue;
     }
-
-    if (!Array.isArray(parsed.criteria) || parsed.criteria.length < 10)
-      return res.status(502).json({ error: "Resposta da IA incompleta. Tente novamente." });
-
-    const avg   = parsed.criteria.reduce((s, c) => s + Number(c.score), 0) / parsed.criteria.length;
-    const score = Math.round(avg * 10) / 10;
-
-    console.log(`[OK] Avaliação gerada — score: ${score}`);
-
-    return res.json({
-      criteria:           parsed.criteria,
-      score,
-      pontos_fortes:      parsed.pontos_fortes      || "",
-      pontos_desenvolver: parsed.pontos_desenvolver  || "",
-      feedback:           parsed.feedback            || ""
-    });
-
-  } catch (err) {
-    console.error("[ERRO] Falha interna:", err.message);
-    return res.status(500).json({ error: "Erro interno. Tente novamente." });
   }
+
+  // Todos os modelos falharam
+  console.error("[ERRO] Todos os modelos falharam. Último erro:", lastError);
+  return res.status(502).json({ error: "Serviço de IA temporariamente indisponível. Tente novamente em alguns minutos." });
 });
 
 app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
@@ -157,5 +200,5 @@ app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
 app.listen(PORT, () => {
   console.log(`✅ Servidor rodando na porta ${PORT}`);
   console.log(`🔑 Chave: ${process.env.OPENROUTER_API_KEY ? "configurada ✓" : "NAO CONFIGURADA ✗"}`);
-  console.log(`🤖 Modelo: google/gemini-2.0-flash-001`);
+  console.log(`🤖 Modelos disponíveis: ${MODELS.join(" → ")}`);
 });
