@@ -6,27 +6,34 @@ const rateLimit = require("express-rate-limit");
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
+// ═══════════════════════════════════════════════
+// MODELO FIXO — NÃO ALTERAR
+// Provider: OpenAI direto (sem Venice, sem Llama)
+// ═══════════════════════════════════════════════
+const MODEL    = "openai/gpt-4o-mini";
+const PROVIDER = { order: ["OpenAI"], allow_fallbacks: false };
+
 app.use(express.json({ limit: "1mb" }));
 
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:5173").split(",");
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    const ok = allowedOrigins.some(o => origin === o) ||
-               /\.vercel\.app$/.test(origin) ||
-               origin === "http://localhost:5173" ||
-               origin === "http://localhost:3000";
+    const ok =
+      allowedOrigins.some(o => origin === o) ||
+      /\.vercel\.app$/.test(origin)           ||
+      origin === "http://localhost:5173"       ||
+      origin === "http://localhost:3000";
     if (ok) return cb(null, true);
     cb(new Error("Not allowed by CORS"));
   }
 }));
 
-const limiter = rateLimit({
+app.use("/api/", rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
   message: { error: "Muitas requisições. Tente novamente em alguns minutos." }
-});
-app.use("/api/", limiter);
+}));
 
 function sanitize(str, maxLen = 8000) {
   if (typeof str !== "string") return "";
@@ -35,14 +42,10 @@ function sanitize(str, maxLen = 8000) {
 
 function validateEvalRequest(body) {
   const { agent, company, type, transcript } = body;
-  if (!agent || typeof agent !== "string" || agent.trim().length < 2)
-    return "Campo 'agent' inválido.";
-  if (!company || typeof company !== "string" || company.trim().length < 1)
-    return "Campo 'company' inválido.";
-  if (!["Ligação", "Chat"].includes(type))
-    return "Campo 'type' deve ser 'Ligação' ou 'Chat'.";
-  if (!transcript || typeof transcript !== "string" || transcript.trim().length < 10)
-    return "Transcrição muito curta ou ausente.";
+  if (!agent   || typeof agent   !== "string" || agent.trim().length   < 2)  return "Campo 'agent' inválido.";
+  if (!company || typeof company !== "string" || company.trim().length < 1)  return "Campo 'company' inválido.";
+  if (!["Ligação", "Chat"].includes(type))                                    return "Campo 'type' deve ser 'Ligação' ou 'Chat'.";
+  if (!transcript || typeof transcript !== "string" || transcript.trim().length < 10) return "Transcrição muito curta ou ausente.";
   return null;
 }
 
@@ -73,8 +76,8 @@ Responda SOMENTE em JSON válido, sem markdown, sem explicações fora do JSON:
 }
 
 app.post("/api/evaluate", async (req, res) => {
-  const validationError = validateEvalRequest(req.body);
-  if (validationError) return res.status(400).json({ error: validationError });
+  const err = validateEvalRequest(req.body);
+  if (err) return res.status(400).json({ error: err });
 
   const { agent, company, type, transcript } = req.body;
   const apiKey = (process.env.OPENROUTER_API_KEY || "").trim();
@@ -85,9 +88,11 @@ app.post("/api/evaluate", async (req, res) => {
   }
 
   console.log(`[INFO] Avaliando — ${agent} | ${company} | ${type}`);
+  console.log(`[INFO] Modelo: ${MODEL} | Provider: OpenAI`);
 
+  let response;
   try {
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type":  "application/json",
@@ -96,16 +101,8 @@ app.post("/api/evaluate", async (req, res) => {
         "X-Title":       "QA Telecom Monitor"
       },
       body: JSON.stringify({
-        // Modelo pago OpenAI — cobrado direto do seu crédito OpenRouter
-        model: "openai/gpt-4o-mini",
-
-        // Força roteamento exclusivo pela OpenAI oficial
-        // Sem fallback para providers intermediários (Venice, etc.)
-        provider: {
-          order: ["OpenAI"],
-          allow_fallbacks: false
-        },
-
+        model:       MODEL,
+        provider:    PROVIDER,
         max_tokens:  1200,
         temperature: 0.3,
         messages: [
@@ -120,70 +117,55 @@ app.post("/api/evaluate", async (req, res) => {
         ]
       })
     });
-
-    console.log(`[INFO] OpenRouter respondeu com status ${response.status}`);
-
-    if (response.status === 401) {
-      const body = await response.text();
-      console.error("[ERRO CRÍTICO] 401 — chave inválida ou sem permissão:", body);
-      return res.status(500).json({ error: "Chave de API inválida. Verifique as configurações do servidor." });
-    }
-
-    if (response.status === 402) {
-      const body = await response.text();
-      console.error("[ERRO] 402 — saldo insuficiente:", body);
-      return res.status(502).json({ error: "Saldo insuficiente na conta OpenRouter. Adicione créditos." });
-    }
-
-    if (response.status === 429) {
-      const body = await response.text();
-      console.error("[ERRO] 429 — rate limit:", body);
-      return res.status(502).json({ error: "Limite de requisições atingido. Tente novamente em instantes." });
-    }
-
-    if (!response.ok) {
-      const body = await response.text();
-      console.error(`[ERRO] HTTP ${response.status}:`, body.slice(0, 300));
-      return res.status(502).json({ error: "Erro ao consultar IA. Tente novamente." });
-    }
-
-    const data = await response.json();
-    const raw  = data.choices?.[0]?.message?.content || "";
-
-    let parsed;
-    try {
-      parsed = JSON.parse(raw.replace(/```json|```/gi, "").trim());
-    } catch {
-      console.error("[ERRO] JSON inválido da IA:", raw.slice(0, 200));
-      return res.status(502).json({ error: "Resposta da IA em formato inválido. Tente novamente." });
-    }
-
-    if (!Array.isArray(parsed.criteria) || parsed.criteria.length < 10)
-      return res.status(502).json({ error: "Resposta da IA incompleta. Tente novamente." });
-
-    const avg   = parsed.criteria.reduce((s, c) => s + Number(c.score), 0) / parsed.criteria.length;
-    const score = Math.round(avg * 10) / 10;
-
-    console.log(`[OK] Avaliação gerada — modelo: openai/gpt-4o-mini | score: ${score}`);
-
-    return res.json({
-      criteria:           parsed.criteria,
-      score,
-      pontos_fortes:      parsed.pontos_fortes      || "",
-      pontos_desenvolver: parsed.pontos_desenvolver  || "",
-      feedback:           parsed.feedback            || ""
-    });
-
-  } catch (err) {
-    console.error("[ERRO] Falha interna:", err.message);
-    return res.status(500).json({ error: "Erro interno. Tente novamente." });
+  } catch (fetchErr) {
+    console.error("[ERRO] Falha na conexão com OpenRouter:", fetchErr.message);
+    return res.status(500).json({ error: "Erro de conexão com a IA. Tente novamente." });
   }
+
+  console.log(`[INFO] OpenRouter status: ${response.status}`);
+
+  if (!response.ok) {
+    const body = await response.text();
+    console.error(`[ERRO] HTTP ${response.status}:`, body.slice(0, 400));
+    if (response.status === 401) return res.status(500).json({ error: "Chave de API inválida." });
+    if (response.status === 402) return res.status(502).json({ error: "Saldo insuficiente na conta OpenRouter." });
+    if (response.status === 429) return res.status(502).json({ error: "Rate limit atingido. Tente novamente em instantes." });
+    return res.status(502).json({ error: "Erro ao consultar IA. Tente novamente." });
+  }
+
+  const data = await response.json();
+  const raw  = data.choices?.[0]?.message?.content || "";
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.replace(/```json|```/gi, "").trim());
+  } catch {
+    console.error("[ERRO] JSON inválido da IA:", raw.slice(0, 200));
+    return res.status(502).json({ error: "Resposta da IA em formato inválido. Tente novamente." });
+  }
+
+  if (!Array.isArray(parsed.criteria) || parsed.criteria.length < 10)
+    return res.status(502).json({ error: "Resposta da IA incompleta. Tente novamente." });
+
+  const avg   = parsed.criteria.reduce((s, c) => s + Number(c.score), 0) / parsed.criteria.length;
+  const score = Math.round(avg * 10) / 10;
+
+  console.log(`[OK] Score: ${score} | Modelo: ${MODEL}`);
+
+  return res.json({
+    criteria:           parsed.criteria,
+    score,
+    pontos_fortes:      parsed.pontos_fortes      || "",
+    pontos_desenvolver: parsed.pontos_desenvolver  || "",
+    feedback:           parsed.feedback            || ""
+  });
 });
 
-app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
+app.get("/api/health", (_req, res) => res.json({ status: "ok", model: MODEL }));
 
 app.listen(PORT, () => {
   console.log(`✅ Servidor rodando na porta ${PORT}`);
   console.log(`🔑 Chave: ${process.env.OPENROUTER_API_KEY ? "configurada ✓" : "NAO CONFIGURADA ✗"}`);
-  console.log(`🤖 Modelo: openai/gpt-4o-mini (provider: OpenAI direto)`);
+  console.log(`🤖 Modelo FIXO: ${MODEL}`);
+  console.log(`🏢 Provider FIXO: OpenAI (sem fallback para Venice/Llama)`);
 });
