@@ -1,15 +1,15 @@
 require("dotenv").config();
-const express  = require("express");
-const cors     = require("cors");
+const express   = require("express");
+const cors      = require("cors");
 const rateLimit = require("express-rate-limit");
-const multer   = require("multer");
-const FormData = require("form-data");
+const multer    = require("multer");
+const FormData  = require("form-data");
 
 // ── App ───────────────────────────────────────────────────────────────────────
 const app = express();
 app.set("trust proxy", 1);
 
-app.use(cors({ origin: true, methods: ["GET","POST","OPTIONS"], credentials: false }));
+app.use(cors({ origin: true, methods: ["GET", "POST", "OPTIONS"], credentials: false }));
 app.options("*", cors());
 app.use(express.json({ limit: "1mb" }));
 
@@ -40,13 +40,13 @@ const OR_STT    = "https://openrouter.ai/api/v1/audio/transcriptions";
 const REFERER   = "https://projetoqatelecom.vercel.app";
 const APP_TITLE = "QA Telecom Monitor";
 
-// Modelo principal: Claude 3 Haiku — melhor custo-benefício para JSON estruturado
-// ~3x mais barato que Sonnet, mesma qualidade para avaliação de atendimento
-// Troque para "anthropic/claude-sonnet-4-5" se quiser máxima qualidade
-const MODEL_EVAL = "anthropic/claude-haiku-4-5";
+// Modelo principal: GPT-4o Mini — estável, custo-benefício excelente para JSON estruturado
+// Fallback: GPT-4.1 Mini — alternativa estável caso o principal falhe
+const MODEL_EVAL         = "openai/gpt-4o-mini";
+const MODEL_EVAL_FALLBACK = "openai/gpt-4.1-mini";
 
 // Modelo de transcrição: Whisper via OpenRouter
-const MODEL_STT  = "openai/whisper-1";
+const MODEL_STT = "openai/whisper-1";
 
 // ── Headers padrão OpenRouter ─────────────────────────────────────────────────
 function orHeaders(key, extra = {}) {
@@ -91,7 +91,7 @@ function sanitize(str, maxLen = 8000) {
   return str.replace(/<[^>]*>/g, "").trim().slice(0, maxLen);
 }
 
-// ── Validação (não alterada) ──────────────────────────────────────────────────
+// ── Validação ─────────────────────────────────────────────────────────────────
 function validateEvalRequest(body) {
   const { agent, company, type, transcript } = body;
   if (!agent    || typeof agent    !== "string" || agent.trim().length < 2)          return "Campo 'agent' inválido.";
@@ -101,7 +101,7 @@ function validateEvalRequest(body) {
   return null;
 }
 
-// ── buildPrompt (não alterada) ────────────────────────────────────────────────
+// ── buildPrompt ───────────────────────────────────────────────────────────────
 function buildPrompt(agent, company, type, transcript) {
   const criteriosLigacao = `saudacao (Saudação), tom_voz (Tom de Voz), tempo_espera (Tempo de Espera), tempo_atendimento (Tempo de Atendimento), uso_mudo (Utilização do Mudo), personalizacao (Personalização), tratativa (Tratativa sondagem resolução), gramatica (Gramática), dados_obrigatorios (Dados obrigatórios), protocolo_encerramento (Protocolo e Encerramento)`;
   const criteriosChat    = `saudacao (Saudação), empatia (Empatia), tempo_espera (Tempo de Espera), tempo_atendimento (Tempo de Atendimento), tempo_resposta (Tempo de Resposta), gramatica (Gramática), sondagem (Sondagem), confirmacao_dados (Confirmação de Dados), personalizacao (Personalização), protocolo_encerramento (Protocolo e Encerramento)`;
@@ -127,29 +127,48 @@ Responda SOMENTE em JSON válido, sem markdown, sem explicações fora do JSON:
 {"criteria":[{"id":"saudacao","score":8,"obs":"observação detalhada"},{"id":"tom_voz","score":7,"obs":"..."},{"id":"tempo_espera","score":9,"obs":"..."},{"id":"tempo_atendimento","score":7,"obs":"..."},{"id":"uso_mudo","score":6,"obs":"..."},{"id":"personalizacao","score":7,"obs":"..."},{"id":"tratativa","score":8,"obs":"..."},{"id":"gramatica","score":8,"obs":"..."},{"id":"dados_obrigatorios","score":9,"obs":"..."},{"id":"protocolo_encerramento","score":6,"obs":"..."}],"pontos_fortes":"texto curto e direto","pontos_desenvolver":"texto curto e direto","feedback":"Feedback construtivo usando primeiro nome do agente"}`;
 }
 
-// ── Chamar modelo de avaliação ────────────────────────────────────────────────
-// Otimizações de token aplicadas:
-// 1. response_format json_object  — elimina markdown e texto fora do JSON
-// 2. max_tokens 1000              — suficiente para o JSON completo (~700 tokens)
-// 3. temperature 0.1              — mais determinístico, menos tokens de "pensamento"
-// 4. provider.sort "price"        — usa o provedor mais barato disponível
-// 5. Sistema compacto             — system message curto reduz prompt tokens
-async function callEvalModel(key, agent, company, type, transcript) {
+// ── Retry com backoff exponencial ────────────────────────────────────────────
+// Tenta até maxRetries vezes em caso de erro 429 (rate limit) ou 5xx
+async function fetchWithRetry(url, options, maxRetries = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, options);
+      // Retry apenas em 429 e erros 5xx (exceto 501)
+      if ((res.status === 429 || (res.status >= 500 && res.status !== 501)) && attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000); // 1s, 2s, 4s (máx 8s)
+        console.warn(`[RETRY] HTTP ${res.status} — tentativa ${attempt}/${maxRetries}, aguardando ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastError = err;
+      if (attempt < maxRetries) {
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+        console.warn(`[RETRY] Erro de rede — tentativa ${attempt}/${maxRetries}, aguardando ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastError || new Error("Todas as tentativas falharam.");
+}
+
+// ── Chamar modelo de avaliação (com fallback de modelo) ───────────────────────
+async function callEvalModel(key, agent, company, type, transcript, model = MODEL_EVAL) {
   const controller = new AbortController();
   const tid = setTimeout(() => controller.abort(), 55000);
 
   try {
-    const res = await fetch(OR_URL, {
+    const res = await fetchWithRetry(OR_URL, {
       method: "POST",
       signal: controller.signal,
       headers: orHeaders(key),
       body: JSON.stringify({
-        model:       MODEL_EVAL,
+        model,
         max_tokens:  1000,
         temperature: 0.1,
-        // Forçar JSON — elimina tokens de markdown e texto extra
         response_format: { type: "json_object" },
-        // Usar provedor mais barato disponível para o modelo
         provider: {
           sort:            "price",
           allow_fallbacks: true,
@@ -157,7 +176,6 @@ async function callEvalModel(key, agent, company, type, transcript) {
         messages: [
           {
             role:    "system",
-            // System message compacto — cada token custa dinheiro
             content: "Avaliador QA Telecom. Responda SOMENTE JSON válido conforme solicitado."
           },
           {
@@ -166,11 +184,25 @@ async function callEvalModel(key, agent, company, type, transcript) {
           }
         ]
       })
-    });
+    }, 3);
     return res;
   } finally {
     clearTimeout(tid);
   }
+}
+
+// ── Chamar modelo com fallback automático ─────────────────────────────────────
+async function callEvalWithFallback(key, agent, company, type, transcript) {
+  // Tenta modelo principal
+  let res = await callEvalModel(key, agent, company, type, transcript, MODEL_EVAL);
+
+  // Se falhar com 429 ou 5xx, tenta modelo de fallback
+  if (!res.ok && (res.status === 429 || res.status >= 500)) {
+    console.warn(`[FALLBACK] Modelo principal falhou (HTTP ${res.status}). Tentando fallback: ${MODEL_EVAL_FALLBACK}`);
+    res = await callEvalModel(key, agent, company, type, transcript, MODEL_EVAL_FALLBACK);
+  }
+
+  return res;
 }
 
 // ── Parsear e validar resposta de avaliação ───────────────────────────────────
@@ -203,6 +235,7 @@ app.get("/api/health", (_req, res) => {
     status:         "ok",
     key_configured: !!process.env.OPENROUTER_API_KEY,
     model_eval:     MODEL_EVAL,
+    model_fallback: MODEL_EVAL_FALLBACK,
     model_stt:      MODEL_STT,
     node:           process.version,
   });
@@ -224,7 +257,7 @@ app.get("/api/test-openrouter", async (_req, res) => {
   }
 });
 
-// ── POST /api/evaluate (texto / arquivo) ─────────────────────────────────────
+// ── POST /api/evaluate ────────────────────────────────────────────────────────
 app.post("/api/evaluate", async (req, res) => {
   const err = validateEvalRequest(req.body);
   if (err) return res.status(400).json({ error: err });
@@ -237,7 +270,7 @@ app.post("/api/evaluate", async (req, res) => {
   try {
     console.log(`[INFO] /evaluate — ${agent} | ${company} | ${type} | ${transcript.length} chars`);
 
-    const orRes = await callEvalModel(key, agent, company, type, transcript);
+    const orRes = await callEvalWithFallback(key, agent, company, type, transcript);
 
     if (!orRes.ok) {
       const errText = await orRes.text();
@@ -247,7 +280,6 @@ app.post("/api/evaluate", async (req, res) => {
     const data  = await orRes.json();
     const raw   = data.choices?.[0]?.message?.content || "";
 
-    // Log de uso para monitorar tokens
     if (data.usage) {
       console.log(`[TOKEN] prompt=${data.usage.prompt_tokens} completion=${data.usage.completion_tokens} total=${data.usage.total_tokens} cost=$${data.usage.cost || "?"}`);
     }
@@ -307,7 +339,7 @@ app.post("/api/evaluate-audio", upload.single("audio"), async (req, res) => {
     const tid  = setTimeout(() => ctrl.abort(), 60000);
     let sttRes;
     try {
-      sttRes = await fetch(OR_STT, {
+      sttRes = await fetchWithRetry(OR_STT, {
         method:  "POST",
         signal:  ctrl.signal,
         headers: {
@@ -317,7 +349,7 @@ app.post("/api/evaluate-audio", upload.single("audio"), async (req, res) => {
           ...form.getHeaders(),
         },
         body: form,
-      });
+      }, 2);
     } finally {
       clearTimeout(tid);
     }
@@ -346,9 +378,9 @@ app.post("/api/evaluate-audio", upload.single("audio"), async (req, res) => {
     if (req.file) req.file.buffer = null;
   }
 
-  // 4. Avaliação com Claude
+  // 4. Avaliação com fallback
   try {
-    const orRes = await callEvalModel(key, agent, company, type, transcript);
+    const orRes = await callEvalWithFallback(key, agent, company, type, transcript);
 
     if (!orRes.ok) {
       const errText = await orRes.text();
@@ -361,6 +393,7 @@ app.post("/api/evaluate-audio", upload.single("audio"), async (req, res) => {
     if (data.usage) {
       console.log(`[TOKEN] prompt=${data.usage.prompt_tokens} completion=${data.usage.completion_tokens} total=${data.usage.total_tokens} cost=$${data.usage.cost || "?"}`);
     }
+    console.log(`[INFO] Modelo usado: ${data.model}`);
 
     let parsed;
     try   { parsed = parseEval(raw); }
@@ -397,7 +430,8 @@ if (process.env.NODE_ENV !== "production" || process.env.LOCAL_DEV === "true") {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`✅ Servidor na porta ${PORT}`);
     console.log(`🔑 Chave: ${process.env.OPENROUTER_API_KEY ? "configurada ✓" : "NÃO CONFIGURADA ✗"}`);
-    console.log(`🤖 Modelo: ${MODEL_EVAL}`);
+    console.log(`🤖 Modelo principal: ${MODEL_EVAL}`);
+    console.log(`🔄 Modelo fallback:  ${MODEL_EVAL_FALLBACK}`);
   });
 }
 
