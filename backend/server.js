@@ -425,13 +425,24 @@ app.use((err, _req, res, _next) => {
 });
 
 // ── Export (Vercel serverless) + listen (Railway/local) ──────────────────────
+const PORT = process.env.PORT || 3001;
+
 if (process.env.NODE_ENV !== "production" || process.env.LOCAL_DEV === "true") {
-  const PORT = process.env.PORT || 3001;
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`✅ Servidor na porta ${PORT}`);
+  const server = app.listen(PORT, "0.0.0.0", () => {
+    console.log(`\x1b[32m✅ Servidor na porta ${PORT}\x1b[0m`);
     console.log(`🔑 Chave: ${process.env.OPENROUTER_API_KEY ? "configurada ✓" : "NÃO CONFIGURADA ✗"}`);
     console.log(`🤖 Modelo principal: ${MODEL_EVAL}`);
-    console.log(`🔄 Modelo fallback:  ${MODEL_EVAL_FALLBACK}`);
+  });
+
+  // Tratamento para evitar erro EADDRINUSE no Windows durante o --watch
+  server.on('error', (e) => {
+    if (e.code === 'EADDRINUSE') {
+      console.error(`\x1b[31m❌ A porta ${PORT} está ocupada. Tentando novamente em 1 segundo...\x1b[0m`);
+      setTimeout(() => {
+        server.close();
+        server.listen(PORT);
+      }, 1000);
+    }
   });
 }
 
